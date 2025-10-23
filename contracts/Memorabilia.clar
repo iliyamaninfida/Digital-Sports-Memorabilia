@@ -13,6 +13,9 @@
 (define-constant err-not-for-sale (err u107))
 (define-constant err-insufficient-funds (err u108))
 (define-constant err-transfer-failed (err u109))
+(define-constant err-offer-not-found (err u110))
+(define-constant err-offer-expired (err u111))
+(define-constant err-offer-exists (err u112))
 
 (define-data-var token-id-nonce uint u0)
 
@@ -48,6 +51,14 @@
   creator: principal,
   percentage: uint
 })
+
+(define-map token-offers {token-id: uint, offerer: principal} {
+  amount: uint,
+  expiration: uint,
+  created-at: uint
+})
+
+(define-map offer-escrow {token-id: uint, offerer: principal} uint)
 
 (define-public (set-verified-creator (creator principal) (verified bool))
   (begin
@@ -236,4 +247,101 @@
 
 (define-read-only (get-token-royalty (token-id uint))
   (ok (map-get? token-royalties token-id))
+)
+
+(define-public (make-offer (token-id uint) (amount uint) (duration-blocks uint))
+  (let (
+    (owner (unwrap! (nft-get-owner? memorabilia token-id) err-not-found))
+    (current-height stacks-block-height)
+    (expiration (+ current-height duration-blocks))
+    (offer-key {token-id: token-id, offerer: tx-sender})
+  )
+    (asserts! (> amount u0) err-invalid-params)
+    (asserts! (> duration-blocks u0) err-invalid-params)
+    (asserts! (not (is-eq tx-sender owner)) err-not-authorized)
+    (asserts! (is-none (map-get? token-offers offer-key)) err-offer-exists)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (map-set token-offers offer-key {
+      amount: amount,
+      expiration: expiration,
+      created-at: current-height
+    })
+    (map-set offer-escrow offer-key amount)
+    (ok true)
+  )
+)
+
+(define-public (cancel-offer (token-id uint))
+  (let (
+    (offer-key {token-id: token-id, offerer: tx-sender})
+    (offer (unwrap! (map-get? token-offers offer-key) err-offer-not-found))
+    (escrowed-amount (unwrap! (map-get? offer-escrow offer-key) err-offer-not-found))
+  )
+    (try! (as-contract (stx-transfer? escrowed-amount tx-sender tx-sender)))
+    (map-delete token-offers offer-key)
+    (map-delete offer-escrow offer-key)
+    (ok escrowed-amount)
+  )
+)
+
+(define-public (accept-offer (token-id uint) (offerer principal))
+  (let (
+    (owner (unwrap! (nft-get-owner? memorabilia token-id) err-not-found))
+    (offer-key {token-id: token-id, offerer: offerer})
+    (offer (unwrap! (map-get? token-offers offer-key) err-offer-not-found))
+    (amount (get amount offer))
+    (expiration (get expiration offer))
+    (escrowed-amount (unwrap! (map-get? offer-escrow offer-key) err-offer-not-found))
+    (royalty-info (map-get? token-royalties token-id))
+  )
+    (asserts! (is-eq tx-sender owner) err-not-token-owner)
+    (asserts! (< stacks-block-height expiration) err-offer-expired)
+    (match royalty-info
+      royalty-data
+      (let (
+        (creator (get creator royalty-data))
+        (royalty-amount (/ (* amount (get percentage royalty-data)) u10000))
+        (seller-amount (- amount royalty-amount))
+      )
+        (try! (as-contract (stx-transfer? royalty-amount tx-sender creator)))
+        (try! (as-contract (stx-transfer? seller-amount tx-sender owner)))
+        (try! (nft-transfer? memorabilia token-id owner offerer))
+        (map-delete marketplace token-id)
+        (map-delete token-offers offer-key)
+        (map-delete offer-escrow offer-key)
+        (ok true)
+      )
+      (begin
+        (try! (as-contract (stx-transfer? amount tx-sender owner)))
+        (try! (nft-transfer? memorabilia token-id owner offerer))
+        (map-delete marketplace token-id)
+        (map-delete token-offers offer-key)
+        (map-delete offer-escrow offer-key)
+        (ok true)
+      )
+    )
+  )
+)
+
+(define-public (reject-offer (token-id uint) (offerer principal))
+  (let (
+    (owner (unwrap! (nft-get-owner? memorabilia token-id) err-not-found))
+    (offer-key {token-id: token-id, offerer: offerer})
+    (offer (unwrap! (map-get? token-offers offer-key) err-offer-not-found))
+    (escrowed-amount (unwrap! (map-get? offer-escrow offer-key) err-offer-not-found))
+  )
+    (asserts! (is-eq tx-sender owner) err-not-token-owner)
+    (try! (as-contract (stx-transfer? escrowed-amount tx-sender offerer)))
+    (map-delete token-offers offer-key)
+    (map-delete offer-escrow offer-key)
+    (ok true)
+  )
+)
+
+(define-read-only (get-offer (token-id uint) (offerer principal))
+  (ok (map-get? token-offers {token-id: token-id, offerer: offerer}))
+)
+
+(define-read-only (get-offer-escrow (token-id uint) (offerer principal))
+  (ok (map-get? offer-escrow {token-id: token-id, offerer: offerer}))
 )
